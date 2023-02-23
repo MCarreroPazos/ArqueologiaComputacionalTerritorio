@@ -1,0 +1,566 @@
+---
+title: "Patrones_Edad_Hierro"
+author: "Miguel Carrero-Pazos"
+date: '2023-02-10'
+output: html_document
+---
+# **Parte 1. Densidad de rutas óptimas. Creación de la covariable**
+# Cargar e instalar paquetes de trabajo específicos
+La primera vez es necesario instalar el paquete fasterRaster:
+```{r, eval=F, echo=T, results='hide', message=FALSE}
+install.packages("remotes")
+remotes::install_github("adamlilith/fasterRaster")
+```
+# Establecer el directorio de datos
+```{r, results='hide', message=FALSE}
+sourcedir <- file.path("datos","datos_raw")
+targetdir <- file.path("datos","datos_derivados")
+if(!dir.exists(targetdir)) dir.create(targetdir)
+```
+# Cálculo de la densidad de rutas óptimas (Least Cost Paths)
+## Instalar y cargar paquetes de trabajo específicos
+```{r, results='hide', message=FALSE}
+required_packages <- c("rgdal", "rgeos", "sp",
+                       "raster","gdistance", 
+                       "leastcostpath", "sf",
+                       "maptools", "spatstat",
+                       "ggplot2", "RColorBrewer",
+                       "fasterRaster")
+if(!all(required_packages %in% installed.packages())) {
+  packages_to_install <- which(!required_packages %in% installed.packages())
+  install.packages(required_packages[packages_to_install],
+                   dependencies = TRUE,
+                   repos = "https://ftp.gwdg.de/pub/misc/cran/")
+}
+```
+Instalar el paquete "terra" desde el CRAN da error, así que mejor desde Github
+```{r, eval=F, echo=T, results='hide', message=FALSE}
+install.packages('terra', repos='https://rspatial.r-universe.dev')
+library(terra)
+```
+## Cargar los paquetes requeridos
+```{r, results='hide', message=FALSE}
+lapply(required_packages, require, character.only = TRUE)
+```
+# Pasos iniciales
+## Cargar el DEM y establecer su resolución en 150m
+```{r results='hide'} 
+dem <- raster(file.path(targetdir,"dem.tif"))
+dem150m <- aggregate(dem, fact=10)
+```
+## Establecer los límites del área de estudio (polígono y línea)
+```{r results='hide'} 
+r <- terra::rast(dem150m)
+pol <- terra::as.polygons(r > -Inf) %>% st_as_sf
+pol_sp <- sf:::as_Spatial(pol$geometry)
+pol_line <- as(pol_sp, "SpatialLines")
+```
+## Cortar el DEM con el polígono del área de estudio y establecer el CRS
+```{r results='hide'} 
+dem_crop <- raster::crop(dem150m, pol_sp)
+raster::crs(dem_crop) <- raster::crs(dem150m)
+```
+# Aproximación FETE (Barber, White, 2012, JAS 39)
+Código basado en https://github.com/josephlewis/leastcostpath
+## Superficie de coste basada en la pendiente y altitud
+```{r results='hide'} 
+cfs <- c("tobler", "tobler offpath", "irmischer-clarke male", "irmischer-clarke offpath male", "irmischer-clarke female", "irmischer-clarke offpath female",
+         "modified tobler", "wheeled transport", "herzog", "llobera-sluckin", "campbell 2019")
+```
+## Establecer el número de vecinos para el cálculo de coste
+```{r results='hide'} 
+neigh <- 4 # 4, 8, 16, 32, 48
+
+slope_cs <- leastcostpath::create_slope_cs(dem = dem_crop, 
+                                           cost_function = "tobler", 
+                                           neighbours = neigh)
+```
+## Cortar la superficie de coste con el polígono del área de estudio
+```{r results='hide'} 
+slope_cs <- crop_cs(slope_cs, pol_sp)
+```
+## Crear puntos regulares a lo largo de los límites del área de estudio
+Note que el código de abajo simplemente crea 100 puntos. Este número puede ampliarse, aunque ampliará considerablemente el tiempo de procesado
+```{r results='hide'} 
+Pts_ext <- spsample(pol_line, n = 100,
+                    type='regular')
+```
+## Establecer las coordenadas de los puntos de muestreo
+```{r results='hide'} 
+crs <- "+proj=utm +zone=29 +ellps=GRS80 +units=m +no_defs"
+coords <- c("x", "y")
+Pts_sf <- st_as_sf(Pts_ext, coords = coords, crs = crs)
+
+Pts_borders <- Pts_sf %>%
+  st_cast("MULTIPOINT") %>%
+  st_cast("POINT")
+
+Pts_borders <- st_coordinates(Pts_borders)
+```
+## Convertir los puntos regulares de los límites del área de estudio en puntos espaciales
+```{r results='hide', warning=FALSE} 
+coords <- data.frame(Pts_borders[,1],Pts_borders[,2])
+datcoords <- cbind(1,coords)
+locs <- sp::SpatialPointsDataFrame(coords,datcoords)
+proj4string(locs) <- CRS("+proj=utm +zone=29 
+                         +ellps=GRS80 +units=m +no_defs")
+```
+## Mapear los puntos de origen y destino sobre la superficie de costes
+```{r} 
+plot(raster(slope_cs))
+plot(locs, add=T)
+```    
+
+## Cálculo del FETE (*From everywhere to everywhere approach*)
+Basado en White y Barber 2012: https://doi.org/10.1016/j.jas.2012.04.017
+El código de abajo calculará las rutas de menor coste para todas las localizaciones proporcionadas, tomando un punto como origen y el resto como destino. El proceso se repite para un segundo punto, y así sucesivamente hasta el total
+```{r, eval=F, echo=T, results='hide', message=FALSE}
+fete_lcp <- leastcostpath::create_FETE_lcps(cost_surface = slope_cs, 
+                                            locations = locs, 
+                                            cost_distance = FALSE, 
+                                            parallel = TRUE)
+```
+## Guardar el vector de las rutas óptimas como shapefile
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+writeOGR(fete_lcp, 
+         file.path(targetdir, "fete_sampleo_lcps.shp"),
+         delete_dsn = TRUE,
+         layer="fete_sampleo_lcps",
+         driver = "ESRI Shapefile",
+         overwrite = TRUE)
+```
+## Para cargar el shapefile de rutas, ejecutar el siguiente código:
+```{r results='hide', message=FALSE} 
+fete_lcp <- sf::st_read(file.path(targetdir,"fete_sampleo_lcps.shp"),
+                     layer = "fete_sampleo_lcps")
+fete_lcp <- as(fete_lcp, "Spatial")
+```
+## Convertir los caminos de menor coste en puntos (input para el análisis de densidad)
+```{r results='hide'} 
+lcp_pts <- spsample(fete_lcp, n = 1000000,
+                    type='regular')
+```
+## Establecer las coordenadas de los puntos a lo largo de las rutas de menor coste
+```{r results='hide'} 
+crs <- "+proj=utm +zone=29 +ellps=GRS80 +units=m +no_defs"
+coords_lcp_pts <- c("x", "y")
+
+lcp_pts_sf <- st_as_sf(lcp_pts, coords = coords_lcp_pts, 
+                       crs = crs)
+
+lcp_pts_sp <- lcp_pts_sf %>%
+  st_cast("MULTIPOINT") %>%
+  st_cast("POINT")
+lcp_pts_sp <- st_coordinates(lcp_pts_sp)
+```
+## Definir la ventana (clase *owin*) para el análisis de densidad
+```{r results='hide'} 
+window <- as(pol_sp, "owin")
+```
+## Crear un objeto de tipo ppp (*point pattern*) a partir de los puntos
+```{r results='hide', warning=FALSE} 
+lcp_pts_pp <- ppp(x = lcp_pts_sp[,1], y = lcp_pts_sp[,2], 
+                  window = window)
+```
+## Calcular la densidad de rutas óptimas
+```{r results='hide'} 
+lcp_density <- density(lcp_pts_pp, sigma = 1200, eps = 100)
+```
+## Ver el mapa de densidad de rutas óptimas
+```{r} 
+plot(raster(lcp_density))
+```
+## Guardar la covariable como geotiff
+```{r results='hide', warning=FALSE} 
+lcp_density_rast <- raster(lcp_density)
+writeRaster(lcp_density_rast,
+            file.path(targetdir, "densidad_rutas_optimas.tiff"),
+            format = "GTiff", 
+            overwrite = TRUE)
+```
+El ráster se guardará en la carpeta "targetdir"
+
+# **Parte 2. Estudio de la distribución: la intensidad espacial**
+## Cargar los paquetes de trabajo (si es necesario)
+```{r results='hide', message=FALSE}
+spatpack<-c("raster","spatstat","rgdal","maptools",
+            "sf")
+lapply(spatpack, require, character.only=TRUE)
+```
+## Establecer el directorio de datos (si es necesario)
+```{r results='hide', message=FALSE}
+sourcedir <- file.path("data","raw_data")
+targetdir <- file.path("data","derived_data")
+if(!dir.exists(targetdir)) dir.create(targetdir)
+```
+## Definir crs
+```{r results='hide'} 
+crs = "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+```
+## Cargar el vector de los yacimientos
+```{r, results='hide', message=FALSE} 
+castros <- sf::st_read(file.path(sourcedir,
+                                 "castros.shp"),
+                       layer = "castros")
+castros <- sf::st_transform(castros, 25829)
+```
+## Crear área de estudio
+```{r results='hide'} 
+bb <- st_as_sfc(st_bbox(castros))
+bb_sp <- as(bb, "Spatial")
+```
+## Convertir el vector del área de estudio en la ventana de análisis (para Spatstat)
+```{r results='hide'} 
+bb_w <- as.owin(bb)
+```
+## Convertir el shapefile de los castros en un patrón de puntos
+```{r results='hide'} 
+sppp_castros <- ppp(x = castros$xcoord, 
+                    y = castros$ycoord, 
+                    window = bb_w)
+
+dem <- raster(file.path(targetdir,
+                        "dem.tif"))
+raster::crs(dem) <- raster::crs(crs)
+```
+## Comprobar Complete Spatial Randomness
+## Función K
+```{r results='hide'} 
+Kfunct_castros <- Kest(sppp_castros, correction = "Ripley")
+plot(Kfunct_castros, xlim = c(0,6000), main = "Función K de Ripley")
+```
+## Densidad de castros
+```{r} 
+par(mfrow = c(1, 3))
+par(mar=c(2,2,2,2))
+plot(density(sppp_castros, sigma = 500), main = "")
+title("Sigma = 500", line=-8)
+plot(density(sppp_castros, sigma = 1000), main = "")
+title("Sigma = 1000", line=-8)
+plot(density(sppp_castros, sigma = 2000), main = "")
+title("Sigma = 2000", line=-8)
+par(mfrow = c(1, 1))
+```
+## Quadrat test
+```{r results='hide'} 
+qtest <- quadrat.test(sppp_castros, 
+                   method = "MonteCarlo")
+qtest # para observar los resultados             
+```
+## Crear el gráfico
+```{r} 
+plot(density(sppp_castros, sigma = 1000, eps=50), main = "Test de cuadrantes")
+plot(qtest, cex = 0.7, col = "white", add = T)
+```
+# **Parte 3. Patrón monovariante**
+## Cargar los paquetes de trabajo (si es necesario)
+```{r results='hide', message=FALSE}
+spatpack<-c("raster","spatstat","rgdal","maptools",
+            "sf")
+lapply(spatpack, require, character.only=TRUE)
+```
+## Establecer el directorio de datos (si es necesario)
+```{r results='hide', message=FALSE}
+sourcedir <- file.path("data","raw_data")
+targetdir <- file.path("data","derived_data")
+if(!dir.exists(targetdir)) dir.create(targetdir)
+```
+## Definir crs (si es necesario)
+```{r results='hide'} 
+crs = "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"            
+```
+## Cargar el vector de los yacimientos (si es necesario)
+```{r, results='hide', message=FALSE} 
+castros <- sf::st_read(file.path(sourcedir,
+                                 "castros.shp"),
+                       layer = "castros")
+castros <- sf::st_transform(castros, 25829)          
+```
+## Crear área de estudio
+```{r results='hide'} 
+bb <- st_as_sfc(st_bbox(castros))
+bb_sp <- as(bb, "Spatial")         
+```
+## Convertir el vector del área de estudio en la ventana de análisis (para Spatstat)
+```{r results='hide'} 
+bb_w <- as.owin(bb)     
+```
+## Convertir el shapefile de los castros en un patrón de puntos
+```{r results='hide'} 
+sppp_castros <- ppp(x = castros$xcoord, 
+                    y = castros$ycoord, 
+                    window = bb_w)    
+```
+## Cargar las covariables raster y establecer el mismo csr
+```{r results='hide', warning=FALSE} 
+dem <- raster(file.path(targetdir,"dem.tif"))
+crs(dem) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+dem <- crop(dem, bb_sp)
+dens_rutas <- raster(file.path(targetdir,"densidad_rutas_optimas.tif"))
+crs(dens_rutas) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+dens_rutas <- projectRaster(dens_rutas, dem)
+i_prom_topo <- raster(file.path(targetdir,"indice_posicion_topografica.tif"))
+crs(i_prom_topo) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+i_prom_topo <- projectRaster(i_prom_topo, dem)
+prom_visual <- raster(file.path(targetdir,"prominencia_visual.tiff"))
+crs(prom_visual) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+prom_visual <- projectRaster(prom_visual, dem)   
+```
+## Convertir las covariables a imagen para la función rhohat
+```{r results='hide'} 
+dem_im <- as.im(dem)
+dens_rutas_im <- as.im(dens_rutas)
+i_prom_topo_im <- as.im(i_prom_topo)
+prom_visual_im <- as.im(prom_visual)
+```
+## Calcular la intensidad de los castros con respecto a las diferentes covariables
+```{r results='hide'} 
+dem.rh <- rhohat(sppp_castros, dem_im, confidence=0.95)
+dens_rutas.rh <- rhohat(sppp_castros, dens_rutas_im, confidence=0.95)
+i_prom_topo.rh <- rhohat(sppp_castros, i_prom_topo_im, confidence=0.95)
+prom_visual.rh <- rhohat(sppp_castros, prom_visual_im, confidence=0.95)
+```
+## Crear los gráficos de intensidad para las covariables
+```{r} 
+par(mfrow=c(2,2))
+par(mar=c(4, 4, 2, 1)) # c(abajo, izquierda, derecha, arriba)
+plot(dem.rh, main="", xlab="Altitud (m.s.n.m.)", ylab="",
+     legend=FALSE, cex.axis=0.9)
+legend("topleft", legend="a. Altitud", cex=0.9, bty='n', 
+       text.font=2)
+plot(dens_rutas.rh, main="", xlab="Densidad de rutas", ylab="", 
+     legend=FALSE, cex.axis=0.9)
+legend("topleft", legend="b. Densidad de rutas de tránsito potencial", 
+       cex=0.9, bty='n', text.font=2)
+plot(i_prom_topo.rh, main="", xlab="Prominencia topográfica", 
+     ylab="", legend=FALSE, cex.axis=0.9)
+legend("topleft", legend="c. Índice de prominencia topográfica",
+       cex=0.9, bty='n', text.font=2)
+plot(prom_visual.rh, main="", xlab="Visibilidad", ylab="", 
+     legend=FALSE, cex.axis=0.9)
+legend("topleft", legend="d. Prominencia visual", 
+       cex=0.9, bty='n', text.font=2)
+par(mfrow=c(1,1))
+```
+## Predecir la densidad de castros dependiendo de las covariables
+```{r} 
+par(mfrow=c(2,2))
+par(mar=c(2, 2, 2, 2)) # c(abajo, izquierda, derecha, arriba)
+# Altitud
+pred_dem.rh <- predict(dem.rh)
+plot(pred_dem.rh, las=1, main = "Altitud")
+# Densidad de rutas óptimas
+pred_dens_rutas.rh <- predict(dens_rutas.rh)
+plot(pred_dens_rutas.rh, las=1, main = "Densidad de tránsito")
+# Prominencia topográfica
+pred_i_prom_topo.rh <- predict(i_prom_topo.rh)
+cl   <- interp.colours(c("lightyellow", "orange" ,"red"), 100)
+plot(pred_i_prom_topo.rh, col=cl, las=1, main = "Prominencia topográfica", gamma = 0.25)
+# Prominencia visual
+pred_prom_visual.rh <- predict(prom_visual.rh)
+plot(pred_prom_visual.rh, col=cl, las=1, main = "Prominencia visual", gamma = 0.25)
+par(mfrow=c(1,1))
+```
+# **Parte 3. Regresión logística y procesos de puntos**
+El siguiente código está basado en Spencer y Bevan 2018; Carrero Pazos, Bevan y Lake, 2019; Riris 2020. Links a los artículos y material supplementario:
+https://discovery.ucl.ac.uk/id/eprint/10055556/
+Código de R: https://github.com/cspencer905/SpencerBevan-MirabelloModelling
+https://discovery.ucl.ac.uk/id/eprint/10077897/
+Código de R: https://github.com/MCarreroPazos/MontePenide
+https://staffprofiles.bournemouth.ac.uk/display/journal-article/332319
+Código de R: adjuntado como material suplementario en la publicación
+Recomendamos también la consulta de **Bevan et al. 2013** y **Bevan 2020** (véase la bibliografía del libro).
+
+## Cargar los paquetes de trabajo
+```{r results='hide', message=FALSE}
+spatpack<-c("raster","spatstat","rgdal","maptools",
+            "sf", "MASS", "RColorBrewer", "virtualspecies",
+            "onpoint", "cowplot", "ggplot2")
+lapply(spatpack, require, character.only=TRUE)
+```
+## Establecer el directorio de datos (si es necesario)
+```{r results='hide', message=FALSE}
+sourcedir <- file.path("data","raw_data")
+targetdir <- file.path("data","derived_data")
+if(!dir.exists(targetdir)) dir.create(targetdir)
+```
+## Cargar el vector del área de estudio y los yacimientos
+```{r results='hide', message=FALSE}
+castros <- sf::st_read(file.path(sourcedir,
+                                 "castros.shp"),
+                       layer = "castros")
+castros <- as(castros, "Spatial")
+```
+## Crear área de estudio
+```{r results='hide'}
+bb <- st_as_sfc(st_bbox(castros))
+bb_sp <- as(bb, "Spatial")
+```
+## Convertir el vector del área de estudio en la ventana de análisis (para Spatstat)
+```{r results='hide'}
+bb_w <- as.owin(bb_sp)
+```
+## Convertir el shapefile de los castros en un patrón de puntos
+```{r results='hide'}
+sppp_castros <- ppp(x = castros$xcoord, 
+                    y = castros$ycoord,
+                    window = bb_w)
+```
+## Cargar las covariables raster y establecer el mismo csr
+```{r results='hide'}
+dem <- raster(file.path(targetdir,"dem.tif"))
+crs(dem) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+dem <- crop(dem, bb_sp)
+dens_rutas <- raster(file.path(targetdir,"densidad_rutas_optimas.tif"))
+crs(dens_rutas) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+dens_rutas <- projectRaster(dens_rutas, dem)
+i_prom_topo <- raster(file.path(targetdir,"indice_posicion_topografica.tif"))
+crs(i_prom_topo) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+i_prom_topo <- projectRaster(i_prom_topo, dem)
+prom_visual <- raster(file.path(targetdir,"prominencia_visual.tiff"))
+crs(prom_visual) <- "+proj=utm +zone=29 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs" 
+prom_visual <- projectRaster(prom_visual, dem)
+```
+## Comprobar variables colineales
+```{r results='hide'}
+covs <- stack(dem, dens_rutas, i_prom_topo, prom_visual)
+removeCollinearity(covs, multicollinearity.cutoff = 0.75,
+                   select.variables = FALSE, sample.points = TRUE, nb.points = 100000,
+                   plot = TRUE) # No hay variables colineales
+```
+## Convertir las covariables a imagen para Spatstat
+```{r results='hide'}
+dem_im <- as.im(dem)
+dens_rutas_im <- as.im(dens_rutas)
+i_prom_topo_im <- as.im(i_prom_topo)
+prom_visual_im <- as.im(prom_visual)
+```
+## Modelo de regresión logística de primer orden
+## Definir los efectos de primer orden
+```{r results='hide'}
+covar_list_mod1 <- list(i_prom_topo_im, prom_visual_im, dens_rutas_im, dem_im)
+names(covar_list_mod1) <- c("i_prom_topo_im", "prom_visual_im", "dens_rutas_im", "dem_im")
+mod1_efectos_primer_orden <- ~ i_prom_topo_im + prom_visual_im + dens_rutas_im + dem_im
+```
+## Crear los modelos de simulación estadística
+### Modelo 1 (efectos de primer orden)
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+mod1 <- step(ppm(sppp_castros, trend = mod1_efectos_primer_orden, 
+                 interaction = NULL, 
+                 covariates = covar_list_mod1, method = "logi"))
+
+summary(mod1)
+```
+## Superficie de intensidad
+```{r results='hide'}
+logodds <- raster(-1.748041e+01+(i_prom_topo_im*1.183857e+00)+(prom_visual_im*3.198531e-01))
+plot(logodds, main="Superficie de intensidad\npredictiva (log-odds)", 
+     col = terrain.colors(8), axes=FALSE, box=FALSE, 
+     legend.args=list(text="",side=2), horizontal=TRUE)
+```
+## Modelo 2 (efectos de primer y segundo orden)
+## Definir la superficie de tendencia de primer orden (eliminar la variable dem -véase summary(mod1))
+```{r results='hide'}
+covar_list_mod2 <- list(i_prom_topo_im, prom_visual_im)
+names(covar_list_mod2) <- c("i_prom_topo_im", "prom_visual_im")
+mod2_efectos_primer_orden <- ~ i_prom_topo_im + prom_visual_im
+```
+## Efectos de segundo orden: interacción *AreaInter (r = 1000)*
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+mod2_areaInter <- step(ppm(sppp_castros, trend = mod2_efectos_primer_orden, 
+                           interaction = AreaInter(r=1000),
+                           covariates = covar_list_mod2))
+```                   
+## Efectos de segundo orden: interacción Hardcore *(hc = 200)*
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+mod2_hardcore <- step(ppm(sppp_castros, trend = mod2_efectos_primer_orden, 
+                          interaction = Hardcore(hc = 200),
+                          covariates = covar_list_mod2))
+```  
+## Calcular las funciones de correlación par
+### Modelo con efectos de primer orden
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+Pcfinhom_mod1 <- envelope(mod1, fun = pcfinhom, correction = "best", nsim = 10000)
+plot(Pcfinhom_mod1, xlim=c(0,5000),ylim=c(0, 5), legend=FALSE, 
+     main = "Efectos de primer orden")
+``` 
+### Modelo con efectos de primer y segundo orden (AreaInter r = 1000)
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+Pcfinhom_mod2A <- envelope(mod2_areaInter, fun= pcfinhom, correction="best", nsim = 10000)
+plot(Pcfinhom_mod2A, xlim=c(0,10000),ylim=c(0, 5), legend=FALSE)
+```
+### Modelo con efectos de primer y segundo orden (Hardcore hc = 198m)
+```{r, eval=F, echo=T, results='hide', message=FALSE} 
+Pcfinhom_mod2B <- envelope(mod2_hardcore, fun= pcfinhom, correction="best", nsim = 10000)
+plot(Pcfinhom_mod2B, xlim=c(0,10000),ylim=c(0, 5), legend=FALSE)
+```
+## Guardar los resultados de la función de correlación par
+```{r, eval=F, echo=T, results='hide', message=FALSE}
+tempdir <- "data/derived_data/funciones_correlacion_par/"
+save(Pcfinhom_mod1, file = file.path(tempdir, "Pcfinhom_mod1.RData"))
+save(Pcfinhom_mod2A, file = file.path(tempdir, "Pcfinhom_mod2A.RData"))
+save(Pcfinhom_mod2B, file = file.path(tempdir, "Pcfinhom_mod2B.RData"))
+```
+## Cargar los resultados de la función de correlación par
+```{r results='hide'}
+tempdir <- "data/derived_data/funciones_correlacion_par/"
+load(file=file.path(tempdir,"Pcfinhom_mod1.RData"))
+load(file=file.path(tempdir,"Pcfinhom_mod2A.RData"))
+load(file=file.path(tempdir,"Pcfinhom_mod2B.RData"))
+```
+## Comprobar los AICs de los diferentes modelos
+```{r, eval=F, echo=T, results='hide', message=FALSE}
+AIC(mod1) # 7656.264
+AIC(mod2_areaInter) # 7155.866
+AIC(mod2_hardcore) # 7470.05
+```
+## Crear los gráficos para las funciones de correlación par
+```{r, warning=FALSE}
+plot1 <- plot_quantums(Pcfinhom_mod1, 
+                       xlab = "Distancia entre puntos (r)",
+                       ylab = "ginhom(r)",
+                       labels=c("Patrón agrupado\nsignificativo", 
+                                "Patrón aleatorio", 
+                                "Patrón regular\nsignificativo"),
+                       #quantum_size= 3,
+                       quantum_position = 0,
+                       quantum=T,
+                       base_size = 10,
+                       title="a. Efectos de primer orden") +
+                       scale_x_continuous(limits = c(0, 8000))
+plot2 <- plot_quantums(Pcfinhom_mod2A, 
+                       xlab = "Distancia entre puntos (r)",
+                       ylab = "ginhom(r)",
+                       labels=c("Patrón agrupado\nsignificativo", 
+                                "Patrón aleatorio", 
+                                "Patrón regular\nsignificativo"),
+                       #quantum_size= 0.5,
+                       quantum_position = 0,
+                       quantum=T,
+                       base_size = 10,
+                       title="b. Efectos de primer y segundo orden\n Interacción AreaInter (r = 1000)",
+                       legend_position = "none") +
+                       scale_x_continuous(limits = c(0, 8000))
+plot3 <- plot_quantums(Pcfinhom_mod2B, 
+                       xlab = "Distancia entre puntos (r)",
+                       ylab = "ginhom(r)",
+                       labels=c("Patrón agrupado\nsignificativo", 
+                                "Patrón aleatorio", 
+                                "Patrón regular\nsignificativo"),
+                       #quantum_size= 0.5,
+                       quantum_position = 0,
+                       quantum=T,
+                       base_size = 10,
+                       title="c. Efectos de primer y segundo orden\n Interacción Hardcore (hc = 200)",
+                       legend_position = "none") +
+                       scale_x_continuous(limits = c(0, 8000))
+ggdraw() +
+  draw_plot(plot1, 0, .5, 1, .5) +
+  draw_plot(plot2, 0, 0, .5, .5) +
+  draw_plot(plot3, .5, 0, .5, .5)
+```
+
+
+
+
+
