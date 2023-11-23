@@ -42,19 +42,19 @@ visib_desde_rutas <- as.im(as(visib_rutas,"SpatialGridDataFrame"))
 (model1 = ppm(sppp~lcp_densidad+t_view+tprom))
 
 # Calcular la K residual del modelo 1
-residualK_mod1 = envelope(model1,Kres,correction="all",nsim=999)
+residualK_mod1 = envelope(model1,Kres,correction="best",nsim=999)
 
 # Modelo 2
 (model2 = ppm(sppp~d_ejes_cuencas+t_horizon+visib_desde_rutas))
 
 # Calcular la K residual del modelo 2
-residualK_mod2 = envelope(model2,Kres,correction="all",nsim=999)
+residualK_mod2 = envelope(model2,Kres,correction="best",nsim=999)
 
 # Modelo 3 (aleatorio)
 (model3 = ppm(sppp~1)) # Modelo nulo
 
 # Calcular la K residual del modelo 3
-residualK_mod3 = envelope(model3,Kres,correction="all",nsim=999)
+residualK_mod3 = envelope(model3,Kres,correction="best",nsim=999)
 
 # Visualizar el criterio de Informacion Akaike para los diferentes modelos
 AIC(model1)
